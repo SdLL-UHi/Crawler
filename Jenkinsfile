@@ -8,12 +8,12 @@ pipeline {
     }
 
     stages {
-        agent {
-            docker {
-                image "python:3.14-slim"
-            }
-        }
         stage('Build Docker Image') {
+            agent {
+                docker {
+                    image "python:3.14-slim"
+                }
+            }
             steps {
                 script {
                     ssedocker {
