@@ -8,6 +8,11 @@ pipeline {
     }
 
     stages {
+        agent {
+            docker {
+                image "python:3.14-slim"
+            }
+        }
         stage('Build Docker Image') {
             steps {
                 script {
