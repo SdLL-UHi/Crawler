@@ -23,9 +23,10 @@ pipeline {
             steps {
                 sh 'mkdir -p "$DOCKER_CONFIG"'
                 script {
-                    ssedocker {
-                        create { target "ghcr.io/sdll-uhi/crawler:${env.BUILD_NUMBER}" }
-                        publish { tag 'latest' }
+                    dockerImage = docker.build("ghcr.io/sdll-uhi/crawler:${env.BUILD_NUMBER}")
+                    docker.withRegistry('https://ghcr.io', 'ssejenkins-by-elscha') {
+                        dockerImage.push()
+                        dockerImage.push("latest")
                     }
                 }
             }
