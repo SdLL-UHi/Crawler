@@ -13,6 +13,7 @@ pipeline {
                 docker {
                     image 'docker:24'
                     reuseNode true
+                    args '-v /var/run/docker.sock:/var/run/docker.sock'
                 }
             }
             environment {
