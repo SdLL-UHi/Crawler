@@ -1,0 +1,6 @@
+{
+    "START_URL": "https://www.uni-hildesheim.de/uhi-einrichtungen/bibliothek",
+    "WHITELIST_PATH_REGEX": ["^uhi-einrichtungen/bibliothek(/.*)?$"],
+    "WORKERS": 1,
+    "MAX_PAGES": 0
+}

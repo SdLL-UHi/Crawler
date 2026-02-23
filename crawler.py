@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 
 import os
+import json
 import re
 import time
 import hashlib
@@ -16,26 +17,110 @@ import threading
 import queue
 from concurrent.futures import ThreadPoolExecutor
 
-BLACKLIST_PATH_REGEX = [
-    r"^sso/.*",
-    r"^qisserver/.*",
-    r"^kontaktformular/.*",
-    # r"^admin/.*",
-    # r"^wp-admin/.*",
-]
+DEFAULT_CONFIG = {
+    "BLACKLIST_PATH_REGEX": [
+        r"^sso/.*",
+        r"^qisserver/.*",
+        r"^kontaktformular/.*",
+        # r"^admin/.*",
+        # r"^wp-admin/.*",
+    ],
+    "MAX_PAGES": 2500,
+    "TIMEOUT": 20,
+    "USER_AGENT": "SimpleTextCrawler/1.0 (+https://example.org; contact=you@example.org)",
+    "OUTPUT_DIR": "out",
+    "START_URL": "https://www.uni-hildesheim.de/",
+    "WHITELIST_PATH_REGEX":  [
+        r"^$",
+    ],
+    "WORKERS": 8
+}
 
-USER_AGENT = "SimpleTextCrawler/1.0 (+https://example.org; contact=you@example.org)"
-TIMEOUT = 20
-MAX_PAGES = 2500
-OUTPUT_DIR = "docs_md"
+config = DEFAULT_CONFIG.copy()
 
-def compile_blacklist(patterns):
-    return [re.compile(p) for p in patterns]
+def load_config():
+    # Open config (if exists) and update defaults
+    if os.path.exists("config.json"):
+        with open("config.json", "r", encoding="utf-8") as f:
+            user_config = json.load(f)
+            config.update(user_config)
+    print_config(config)
 
-def is_blacklisted(url: str, compiled) -> bool:
+def compile_patterns(patterns, name: str):
+    compiled = []
+    for p in patterns:
+        try:
+            compiled.append(re.compile(p))
+        except re.error as e:
+            print(f"Invalid Regex in {name}: {p!r} -> {e}")
+    return compiled
+
+def serialize_config(config: dict):
+    output = {}
+    for key, value in config.items():
+        if isinstance(value, list):
+            output[key] = [
+                v.pattern if isinstance(v, re.Pattern) else v
+                for v in value
+            ]
+        elif isinstance(value, re.Pattern):
+            output[key] = value.pattern
+        else:
+            output[key] = value
+    return output
+
+
+def print_config(config: dict):
+    RED = "\033[91m"
+    RESET = "\033[0m"
+    printable = serialize_config(config)
+    print("\nActive Configuration:\n")
+    for key, value in printable.items():
+        print(f"{key}: {RED}{value}{RESET}")
+
+def path_for_match(url: str) -> str:
     p = urlparse(url)
-    path = (p.path or "/").lstrip("/")  # match like "sso/..."
-    return any(rx.search(path) for rx in compiled)
+    return (p.path or "/").lstrip("/")  # "sso/..." statt "/sso/..."
+
+def is_whitelisted(url: str, compiled_whitelist: list[re.Pattern]) -> bool:
+    # Wenn keine Whitelist-Regeln angegeben sind: alles zulassen
+    if not compiled_whitelist:
+        return True
+    path = path_for_match(url)
+    return any(rx.search(path) for rx in compiled_whitelist)
+
+def is_blacklisted(url: str, compiled_blacklist: list[re.Pattern]) -> bool:
+    path = path_for_match(url)
+    return any(rx.search(path) for rx in compiled_blacklist)
+
+def is_allowed_url(
+    url: str,
+    start_netloc: str,
+    rp: RobotFileParser,
+    user_agent: str,
+    whitelist_rx: list[re.Pattern],
+    blacklist_rx: list[re.Pattern],
+) -> bool:
+    p = urlparse(url)
+    if p.scheme not in ("http", "https"):
+        return False
+    if not same_site(start_netloc, p.netloc):
+        return False
+
+    # robots.txt
+    try:
+        if not rp.can_fetch(user_agent, url):
+            return False
+    except Exception:
+        pass  # im Zweifel erlauben (wie bei dir)
+
+    # whitelist / blacklist
+    if not is_whitelisted(url, whitelist_rx):
+        return False
+    if is_blacklisted(url, blacklist_rx):
+        return False
+
+    return True
 
 def norm_url(base: str, href: str) -> str | None:
     """Resolve + remove fragments + basic cleanup."""
@@ -122,34 +207,35 @@ def extract_main_markdown(html: str, page_url: str) -> tuple[str, str]:
         "aside#secondary.widget-area",
         "a#totop.hidden",
         "div.navigation",
-        "header#uni-head"
+        "header",
+        "li.nav-item",
+        "ul.submenu-dropdown",
+        "nav"
     ]
 
     # remove noise
     for tag in soup(["script", "style", "noscript", "template", "svg"]):
         tag.decompose()
+
+    main = soup.find("main")
+    if main is None:
+        main = soup.body or soup
         
-    for el in soup.select(",".join(selectors)):
+    for el in main.select(",".join(selectors)):
         el.decompose()
 
-    # EXCLUDE all headers
-    #for ft in soup.find_all("header"):
-    #    ft.decompose()
-
     # EXCLUDE all footers
-    for ft in soup.find_all("footer"):
+    for ft in main.find_all("footer"):
         ft.decompose()
         
-    for h in soup.select("h1,h2,h3,h4,h5,h6"):
+    for h in main.select("h1,h2,h3,h4,h5,h6"):
         # get_text strips all tags; if there's no visible text, drop the heading
         if not h.get_text(" ", strip=True):
             h.decompose()
 
     head_title = ""
-    if soup.title and soup.title.string:
-        head_title = soup.title.string.strip()
-        
-    main = soup.body or soup
+    if main.title and main.title.string:
+        head_title = main.title.string.strip()
 
     # Convert HTML->Markdown.
     # markdownify keeps <strong>/<em>, lists, headings etc.
@@ -174,18 +260,21 @@ def get_session() -> requests.Session:
     sess = getattr(_thread_local, "session", None)
     if sess is None:
         sess = requests.Session()
-        sess.headers.update({"User-Agent": USER_AGENT})
+        sess.headers.update({"User-Agent": config["USER_AGENT"]})
         _thread_local.session = sess
     return sess
 
 def crawl(start_url: str, workers: int = 8):
-    blacklist_rx = compile_blacklist(BLACKLIST_PATH_REGEX)
-    print(f"\nStart crawling with {workers} workers at {MAX_PAGES} pages.")
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    # Compile regex patterns
+    blacklist_rx = compile_patterns(config["BLACKLIST_PATH_REGEX"], "BLACKLIST_PATH_REGEX")
+    whitelist_rx = compile_patterns(config["WHITELIST_PATH_REGEX"], "WHITELIST_PATH_REGEX")
+
+    print(f"\nStart crawling with {config['WORKERS']} workers at {config['MAX_PAGES']} pages.")
+    os.makedirs(config["OUTPUT_DIR"], exist_ok=True)
 
     rp = build_robot_parser(start_url)
     try:
-        crawl_delay = rp.crawl_delay(USER_AGENT)
+        crawl_delay = rp.crawl_delay(config["USER_AGENT"])
     except Exception:
         crawl_delay = None
     if crawl_delay is None:
@@ -217,21 +306,7 @@ def crawl(start_url: str, workers: int = 8):
             next_allowed_time = time.monotonic() + float(crawl_delay)
 
     def should_take(url: str) -> bool:
-        """Atomically 'claim' url for processing."""
-        if is_blacklisted(url, blacklist_rx):
-            return False
-
-        p = urlparse(url)
-        if p.scheme not in ("http", "https"):
-            return False
-        if not same_site(start_netloc, p.netloc):
-            return False
-
-        try:
-            allowed = rp.can_fetch(USER_AGENT, url)
-        except Exception:
-            allowed = True
-        if not allowed:
+        if not is_allowed_url(url, start_netloc, rp, config["USER_AGENT"], whitelist_rx, blacklist_rx):
             return False
 
         with seen_lock:
@@ -248,9 +323,9 @@ def crawl(start_url: str, workers: int = 8):
     def worker():
         nonlocal pages
         while True:
-            # stop condition: reached max pages
+            # stop condition: reached max pages (0 = unlimited)
             with pages_lock:
-                if pages >= MAX_PAGES:
+                if config["MAX_PAGES"] and pages >= config["MAX_PAGES"]:
                     return
 
             try:
@@ -268,7 +343,7 @@ def crawl(start_url: str, workers: int = 8):
 
                 session = get_session()
                 try:
-                    resp = session.get(url, timeout=TIMEOUT, allow_redirects=True)
+                    resp = session.get(url, timeout=config["TIMEOUT"], allow_redirects=True)
                 except requests.RequestException:
                     mark_done(url)
                     q.task_done()
@@ -300,11 +375,10 @@ def crawl(start_url: str, workers: int = 8):
 
                 # Write markdown file (use final url for naming)
                 fn = safe_filename(final_url)
-                out_path = os.path.join(OUTPUT_DIR, fn)
+                out_path = os.path.join(config["OUTPUT_DIR"], fn)
 
                 parsed = urlparse(final_url)
                 md_doc = []
-                md_doc.append(f"# {head_title or parsed.path or final_url}\n")
                 md_doc.append(body_md)
                 md_doc.append("\n---\n")
                 md_doc.append(f"*Quelle:* {final_url}\n")
@@ -323,22 +397,20 @@ def crawl(start_url: str, workers: int = 8):
                     nxt = norm_url(final_url, a.get("href"))
                     if not nxt:
                         continue
-                    p2 = urlparse(nxt)
-                    if p2.scheme not in ("http", "https"):
-                        continue
-                    if not same_site(start_netloc, p2.netloc):
-                        continue
-                    if is_blacklisted(nxt, blacklist_rx):
+
+                    if not is_allowed_url(nxt, start_netloc, rp, config["USER_AGENT"], whitelist_rx, blacklist_rx):
                         continue
 
-                    # Important: don't enqueue endlessly; also reduce duplicates early
                     with seen_lock:
                         if nxt in seen or nxt in in_progress:
                             continue
                     q.put(nxt)
 
                 # Progress (queue.qsize() is approximate in threads)
-                print_progress(current_pages, MAX_PAGES, q.qsize(), final_url)
+                if config["MAX_PAGES"] > 0:
+                    print_progress(current_pages, config["MAX_PAGES"], q.qsize(), final_url)
+                else:
+                    print_progress_unlimited(current_pages, q.qsize(), final_url)
 
                 mark_done(url)
 
@@ -355,7 +427,7 @@ def crawl(start_url: str, workers: int = 8):
         for f in futures:
             f.result()
 
-    print(f"\nDone. Saved {pages} pages to '{OUTPUT_DIR}/' (seen={len(seen)}).")
+    print(f"\nDone. Saved {pages} pages to '{config['OUTPUT_DIR']}/' (seen={len(seen)}).")
 
 def print_progress(done: int, total: int, queue_len: int, current_url: str, bar_width: int = 30):
     total = max(1, total)
@@ -369,18 +441,14 @@ def print_progress(done: int, total: int, queue_len: int, current_url: str, bar_
     if done == total:
        print()  # newline
 
+def print_progress_unlimited(done: int, queue_len: int, current_url: str):
+    msg = f"\r{done} pages | queue={queue_len:4d} | {current_url[:120]:120}"
+    print("\r" + msg, end="", flush=True)
 
 if __name__ == "__main__":
     import argparse
 
     ap = argparse.ArgumentParser(description="Simple crawler that respects robots.txt and saves page text as Markdown.")
-    ap.add_argument("url", help="Start URL, e.g. https://example.com")
-    ap.add_argument("--out", default=OUTPUT_DIR, help="Output directory (default: crawl_md)")
-    ap.add_argument("--max-pages", type=int, default=MAX_PAGES, help="Max pages to crawl (default: 500)")
-    ap.add_argument("--workers", type=int, default=8, help="Number of worker threads (default: 8)")
-    args = ap.parse_args()
+    load_config()
 
-    OUTPUT_DIR = args.out
-    MAX_PAGES = args.max_pages
-
-    crawl(args.url, workers=args.workers)
+    crawl(config["START_URL"], workers=config.get("WORKERS", 8))
